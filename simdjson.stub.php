@@ -25,6 +25,11 @@ const SIMDJSON_INVALID_UTF8_IGNORE = UNKNOWN;
  * @cvalue SIMDJSON_INVALID_UTF8_SUBSTITUTE
  */
 const SIMDJSON_INVALID_UTF8_SUBSTITUTE = UNKNOWN;
+/**
+ * @var int
+ * @cvalue SIMDJSON_ENCODE_NON_NULL
+ */
+const SIMDJSON_ENCODE_NON_NULL = UNKNOWN;
 
 // Encoder errors
 /**
@@ -358,7 +363,7 @@ function simdjson_utf8_len(string $string): int|bool {}
  * Returns the JSON representation of a value
  *
  * @param mixed $value The value being encoded. Can be any type except a resource.
- * @param int $flags Bitmask consisting of SIMDJSON_PRETTY_PRINT or SIMDJSON_APPEND_NEWLINE.
+ * @param int $flags Bitmask consisting of SIMDJSON_PRETTY_PRINT, SIMDJSON_APPEND_NEWLINE or SIMDJSON_ENCODE_NON_NULL.
  * @param int $depth Set the maximum depth. Must be greater than zero.
  * @return string
  * @throws SimdJsonEncoderException
@@ -371,7 +376,7 @@ function simdjson_encode(mixed $value, int $flags = 0, int $depth = 512): string
  *
  * @param mixed $value The value being encoded. Can be any type except a resource.
  * @param resource $res A file system pointer resource that is typically created using fopen().
- * @param int $flags Bitmask consisting of SIMDJSON_PRETTY_PRINT, SIMDJSON_APPEND_NEWLINE or SIMDJSON_INVALID_UTF8_SUBSTITUTE.
+ * @param int $flags Bitmask consisting of SIMDJSON_PRETTY_PRINT, SIMDJSON_APPEND_NEWLINE, SIMDJSON_INVALID_UTF8_SUBSTITUTE or SIMDJSON_ENCODE_NON_NULL.
  * @param int $depth Set the maximum depth. Must be greater than zero.
  * @return bool
  * @throws SimdJsonEncoderException

@@ -45,6 +45,9 @@ extern "C" {
 #include "simdjson_smart_str.h"
 #include "simdutf.h"
 
+#include <unordered_map>
+#include <vector>
+
 static zend_always_inline bool simdjson_check_stack_limit(void) {
 #ifdef ZEND_CHECK_STACK_LIMIT
 	return zend_call_stack_overflowed(EG(stack_limit));
@@ -408,7 +411,7 @@ static zend_result simdjson_encode_packed_array(smart_str *buf, HashTable *table
 		simdjson_smart_str_appendc(buf, ',');
     } ZEND_HASH_FOREACH_END();
 
-    ZSTR_LEN(buf->s)--; // remove last comma
+		ZSTR_LEN(buf->s)--; // remove last comma
 
 	SIMDJSON_HASH_UNPROTECT_RECURSION(recursion_rc);
 
@@ -430,6 +433,7 @@ static zend_result simdjson_encode_mixed_array(smart_str *buf, HashTable *table,
 	zend_ulong index;
 	zend_refcounted *recursion_rc = (zend_refcounted *)table;
 
+	bool has_entries = false;
     ZEND_ASSERT(recursion_rc != NULL);
 
 	if (GC_IS_RECURSIVE(recursion_rc)) {
@@ -443,8 +447,11 @@ static zend_result simdjson_encode_mixed_array(smart_str *buf, HashTable *table,
 	++encoder->depth;
 
 	ZEND_HASH_FOREACH_KEY_VAL_IND(table, index, key, data) {
+		if (UNEXPECTED((encoder->options & SIMDJSON_ENCODE_NON_NULL) && Z_TYPE_P(data) == IS_NULL)) {
+			continue;
+		}
+		has_entries = true;
 		simdjson_pretty_print_nl_ident(buf, encoder);
-
 		if (EXPECTED(key)) {
 			if (UNEXPECTED(simdjson_escape_string(buf, key, encoder) == FAILURE)) {
 				SIMDJSON_HASH_UNPROTECT_RECURSION(recursion_rc);
@@ -453,18 +460,17 @@ static zend_result simdjson_encode_mixed_array(smart_str *buf, HashTable *table,
 		} else {
 		    simdjson_append_number_index(buf, index);
 		}
-
 		simdjson_pretty_print_colon(buf, encoder);
-
 		if (UNEXPECTED(simdjson_encode_zval(buf, data, encoder) == FAILURE)) {
 			SIMDJSON_HASH_UNPROTECT_RECURSION(recursion_rc);
 			return FAILURE;
 		}
-
 		simdjson_smart_str_appendc(buf, ',');
 	} ZEND_HASH_FOREACH_END();
 
-	ZSTR_LEN(buf->s)--; // remove last comma
+	if (has_entries) {
+		ZSTR_LEN(buf->s)--; // remove last comma
+	}
 
 	SIMDJSON_HASH_UNPROTECT_RECURSION(recursion_rc);
 
@@ -491,13 +497,39 @@ static zend_always_inline bool simdjson_is_simple_object(zval *val) {
         ;
 }
 
+struct simdjson_public_prop_cache {
+	std::vector<zend_property_info*> props;
+};
+
+static zend_always_inline const std::vector<zend_property_info*>& simdjson_get_public_properties(zend_class_entry *ce) {
+	static std::unordered_map<zend_class_entry*, simdjson_public_prop_cache> cache;
+
+	auto it = cache.find(ce);
+	if (EXPECTED(it != cache.end())) {
+		return it->second.props;
+	}
+
+	simdjson_public_prop_cache cached;
+	for (int i = 0; i < ce->default_properties_count; i++) {
+		zend_property_info *prop_info = ce->properties_info_table[i];
+		if (!prop_info) {
+			continue;
+		}
+		if (prop_info->flags & ZEND_ACC_PUBLIC) {
+			cached.props.push_back(prop_info);
+		}
+	}
+
+	auto result = cache.emplace(ce, std::move(cached));
+	return result.first->second.props;
+}
+
 static zend_result simdjson_encode_simple_object(smart_str *buf, zval *val, simdjson_encoder *encoder) {
 	int need_comma = 0;
 
 	/* Optimized version without rebuilding properties HashTable */
 	zend_object *obj = Z_OBJ_P(val);
 	zend_class_entry *ce = obj->ce;
-	zend_property_info *prop_info;
 	zval *prop;
 
 	if (GC_IS_RECURSIVE(obj)) {
@@ -510,40 +542,32 @@ static zend_result simdjson_encode_simple_object(smart_str *buf, zval *val, simd
 	simdjson_smart_str_appendc(buf, '{');
 	++encoder->depth;
 
-	for (int i = 0; i < ce->default_properties_count; i++) {
-		prop_info = ce->properties_info_table[i];
-		if (!prop_info) {
-			continue;
-		}
-		if (ZSTR_VAL(prop_info->name)[0] == '\0' && ZSTR_LEN(prop_info->name) > 0) {
-			/* Skip protected and private members. */
-			continue;
-		}
-		prop = OBJ_PROP(obj, prop_info->offset);
-		if (Z_TYPE_P(prop) == IS_UNDEF) {
-			continue;
+		const auto& public_props = simdjson_get_public_properties(ce);
+		for (auto prop_info : public_props) {
+			prop = OBJ_PROP(obj, prop_info->offset);
+			if (Z_TYPE_P(prop) == IS_UNDEF) {
+				continue;
+			}
+			if (UNEXPECTED((encoder->options & SIMDJSON_ENCODE_NON_NULL) && Z_TYPE_P(prop) == IS_NULL)) {
+				continue;
+			}
+			if (need_comma) {
+				simdjson_smart_str_appendc(buf, ',');
+			} else {
+				need_comma = 1;
+			}
+			simdjson_pretty_print_nl_ident(buf, encoder);
+			if (simdjson_escape_string(buf, prop_info->name, encoder) == FAILURE) {
+				SIMDJSON_HASH_UNPROTECT_RECURSION(obj);
+				return FAILURE;
+			}
+			simdjson_pretty_print_colon(buf, encoder);
+			if (simdjson_encode_zval(buf, prop, encoder) == FAILURE) {
+				SIMDJSON_HASH_UNPROTECT_RECURSION(obj);
+				return FAILURE;
+			}
 		}
 
-		if (need_comma) {
-			simdjson_smart_str_appendc(buf, ',');
-		} else {
-			need_comma = 1;
-		}
-
-		simdjson_pretty_print_nl_ident(buf, encoder);
-
-		if (simdjson_escape_string(buf, prop_info->name, encoder) == FAILURE) {
-			SIMDJSON_HASH_UNPROTECT_RECURSION(obj);
-			return FAILURE;
-		}
-
-		simdjson_pretty_print_colon(buf, encoder);
-
-		if (simdjson_encode_zval(buf, prop, encoder) == FAILURE) {
-			SIMDJSON_HASH_UNPROTECT_RECURSION(obj);
-			return FAILURE;
-		}
-	}
 
 	SIMDJSON_HASH_UNPROTECT_RECURSION(obj);
 	if (encoder->depth > encoder->max_depth) {
@@ -625,6 +649,11 @@ static zend_result simdjson_encode_object(smart_str *buf, zval *val, simdjson_en
                 }
 #endif
 
+                if (UNEXPECTED((encoder->options & SIMDJSON_ENCODE_NON_NULL) && Z_TYPE_P(data) == IS_NULL)) {
+                    zval_ptr_dtor(&tmp);
+                    continue;
+                }
+
                 if (need_comma) {
                     simdjson_smart_str_appendc(buf, ',');
                 } else {
@@ -639,6 +668,11 @@ static zend_result simdjson_encode_object(smart_str *buf, zval *val, simdjson_en
                     return FAILURE;
                 }
             } else {
+                if (UNEXPECTED((encoder->options & SIMDJSON_ENCODE_NON_NULL) && Z_TYPE_P(data) == IS_NULL)) {
+                    zval_ptr_dtor(&tmp);
+                    continue;
+                }
+
                 if (need_comma) {
                     simdjson_smart_str_appendc(buf, ',');
                 } else {
