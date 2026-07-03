@@ -10,7 +10,13 @@
     "source": "https://github.com/JakubOnderka/simdjson_php"
   },
   "php-ext": {
-    "extension-name": "simdjson"
+    "extension-name": "simdjson",
+    "configure-options": [
+      {
+        "name": "enable-simdjson",
+        "description": "Enable simdjson support"
+      }
+    ]
   },
   "require": {
     "php": ">=8.0"
