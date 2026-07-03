@@ -2,20 +2,6 @@
 /* begin file include/simdutf.h */
 #ifndef SIMDUTF_H
 #define SIMDUTF_H
-// Windows-specific: define NOMINMAX *before* any header pulls in <windows.h>,
-// so the SDK's min/max macros do not collide with std::min/std::max used
-// later in this file (simdutf uses std::min at line 1701 and 1748, before
-// <algorithm> is included at line 6405).
-#ifdef _WIN32
-  #ifndef NOMINMAX
-    #define NOMINMAX
-  #endif
-#endif
-// Pull in <algorithm> up front so std::min/std::max are visible before they
-// are first referenced at line 1701 (the original file only includes
-// <algorithm> at line 6405, which works on Linux/macOS but trips MSVC's
-// <cstdlib> -> <windows.h> -> min/max macro pollution).
-#include <algorithm>
 #include <cstring>
 
 /* begin file include/simdutf/compiler_check.h */
