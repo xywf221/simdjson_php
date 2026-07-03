@@ -1072,9 +1072,19 @@ static SAPI_POST_HANDLER_FUNC(simdjson_post_handler) {
     // intentionally empty
 }
 
+// PHP 8.5 changed sapi_post_entry.content_type from char * to const char *.
+// A const-qualified array decays to const char * in both cases; on older PHP
+// we still get away with a non-const literal because the implicit conversion
+// of a string literal to char * is a pre-existing extension concern.
+#if PHP_VERSION_ID >= 80500
+static const char simdjson_post_content_type[] = "application/json";
+#else
+static char simdjson_post_content_type[] = "application/json";
+#endif
+
 static sapi_post_entry simdjson_post_entry = {
-    "application/json",
-    sizeof("application/json") - 1,
+    simdjson_post_content_type,
+    sizeof(simdjson_post_content_type) - 1,
     simdjson_post_reader,
     simdjson_post_handler
 };
