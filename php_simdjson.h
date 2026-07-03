@@ -14,20 +14,8 @@
 #ifndef PHP_SIMDJSON_H
 #define PHP_SIMDJSON_H
 
-/*
- * Error constant implementation notes:
- *
- * - 0 always means success, and non-0 is a failure condition.
- * - Prefix these with SIMDJSON_PHP_ERR_ to distinguish them from other values.
- * - The error codes (value or labels) belonging to the C simdjson project may change in the future.
- *
- *   Maybe these should be exposed as extern const once there's a project that needs the other values.
- *   For now, they're also exposed as `REGISTER_LONG_CONSTANT("SIMDJSON_ERR_" #errcode, (val), CONST_PERSISTENT)`
- */
 #define SIMDJSON_PHP_ERR_SUCCESS 0
 #define SIMDJSON_PHP_ERR_INVALID_PHP_PROPERTY 255
-#define SIMDJSON_PHP_ERR_KEY_COUNT_NOT_COUNTABLE 254
-#define SIMDJSON_PHP_ERR_INPUT_SIZE_EXCEEDS 253
 
 /*
  * Put all of the publicly visible functionality and macros into the same header file
@@ -73,12 +61,6 @@ extern zend_module_entry simdjson_module_entry;
  * of storing them in the hash table might exceed the benefits.
  */
 #define SIMDJSON_MAX_DEDUP_LENGTH             64
-/**
- * Maximum block size that will be read from SAPI in case of
- * application/json type or when using simdjson_decode_from_input()
- */
-#define SIMDJSON_SAPI_POST_BLOCK_SIZE         (SAPI_POST_BLOCK_SIZE * 4)
-
 /**
 * Configure simdjson library
 */
@@ -129,10 +111,8 @@ ZEND_TSRMLS_CACHE_EXTERN()
 #	define PHP_SIMDJSON_API /* nothing special */
 #endif
 
-/** Defines 'class SimdJsonException' and 'class SimdJsonBase64Encode' */
 extern PHP_SIMDJSON_API zend_class_entry *simdjson_decoder_exception_ce;
 extern PHP_SIMDJSON_API zend_class_entry *simdjson_encoder_exception_ce;
-extern PHP_SIMDJSON_API zend_class_entry *simdjson_base64_encode_ce;
 
 extern zend_string *simdjson_json_serialize;
 
@@ -145,17 +125,6 @@ extern zend_string *simdjson_json_serialize;
 typedef uint8_t simdjson_php_error_code;
 
 /* NOTE: Callers should check if len is greater than 4GB - simdjson will always return a non zero error code for those */
-
-/**
- * Returns or creates the singleton parser used internally by simdjson (e.g. for the `php_simdjson_*_default()` methods).
- * (Thread-local in ZTS builds of PHP)
- *
- * Callers must NOT free this.
- */
-PHP_SIMDJSON_API struct simdjson_php_parser *php_simdjson_get_default_singleton_parser(void);
-
-/* FIXME add php_simdjson_get_default_singleton_parser api */
-/* FIXME add php_simdjson_decode_with_default_singleton_parser(return_value, json, len, bool associative) */
 
 /**
  * Returns the error message corresponding to a given error code returned by a call to simdjson_php.
@@ -191,50 +160,6 @@ PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_validate(struct simdjson_p
  * If the returned error code is non-0, then return_value will not be initialized.
  */
 PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_parse(struct simdjson_php_parser* parser, const zend_string *json, zval *return_value, bool associative, size_t depth);
-
-/**
- * Parses the given string into a return code. You have to be sure that the provided JSON contains simdjson::SIMDJSON_PADDING
- *
- * If the returned error code is 0, then return_value contains the parsed value.
- * If the returned error code is non-0, then return_value will not be initialized.
- */
-PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_parse_buffer(simdjson_php_parser* parser, const char *json, size_t len, zval *return_value, bool associative, size_t depth);
-
-/**
- * Parses the part of the given string at the json pointer 'key' into a PHP value at return_value
- *
- * If the returned error code is 0, then return_value contains the parsed value (or null).
- * If the returned error code is non-0, then return_value will not be initialized.
- *
- * - SIMDJSON_ERR_NO_SUCH_FIELD is returned if the json pointer 'key' is not found
- * - Other errors are returned for invalid json, etc.
- *
- * @see https://www.rfc-editor.org/rfc/rfc6901.html
- */
-PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_key_value(struct simdjson_php_parser* parser, const zend_string *json, const char *key, zval *return_value, bool associative, size_t depth);
-/**
- * Checks if the json pointer 'key' exists in the given json string.
- *
- * - 0 if the key exists
- * - NO_SUCH_FIELD if a field does not exist in an object
- * - INDEX_OUT_OF_BOUNDS if an array index is larger than an array length
- * - INCORRECT_TYPE if a non-integer is used to access an array
- * - INVALID_JSON_POINTER if the JSON pointer is invalid and cannot be parsed
- *
- * @see https://www.rfc-editor.org/rfc/rfc6901.html
- */
-PHP_SIMDJSON_API uint8_t php_simdjson_key_exists(struct simdjson_php_parser* parser, const zend_string *json, const char *key);
-/**
- * Count the keys of the given array/object at json pointer 'key' exists in the given json string.
- *
- * If the returned error code is 0, then the zval in return_value is overwritten with the key count using ZVAL_LONG.
- * - For arrays, this is the array size
- * - For objects, this is the object size
- * - For other values, this is 0 (when fail_if_uncountable is false)
- *
- * @see https://www.rfc-editor.org/rfc/rfc6901.html
- */
-PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_key_count(struct simdjson_php_parser* parser, const zend_string *json, const char *key, zval *return_value);
 
 END_EXTERN_C()
 

@@ -19,10 +19,8 @@ extern "C" {
 #include "php.h"
 #include "zend_exceptions.h"
 #include "zend_smart_str.h"
-#include "main/SAPI.h"
 #include "ext/standard/info.h"
 #include "ext/spl/spl_exceptions.h"
-#include "ext/json/php_json.h" /* For php_json_serializable_ce */
 
 #include "php_simdjson.h"
 
@@ -31,7 +29,6 @@ extern "C" {
  */
 PHP_SIMDJSON_API zend_class_entry *simdjson_decoder_exception_ce;
 PHP_SIMDJSON_API zend_class_entry *simdjson_encoder_exception_ce;
-PHP_SIMDJSON_API zend_class_entry *simdjson_base64_encode_ce;
 
 } /* end extern "C" */
 
@@ -43,7 +40,6 @@ PHP_SIMDJSON_API zend_class_entry *simdjson_base64_encode_ce;
 #include "src/simdjson_encoder.h"
 /* Single header file from fork of simdjson C project (to imitate php's handling of infinity/overflowing integers in json_decode) */
 #include "src/simdjson.h"
-#include "src/simdutf.h"
 
 #include "simdjson_arginfo.h"
 
@@ -56,13 +52,6 @@ ZEND_DECLARE_MODULE_GLOBALS(simdjson);
 
 #define SIMDJSON_CAPACITY_RECLAIM_THRESHOLD 1024 * 1024 * 1 // 1MB
 #define SIMDJSON_SHOULD_REUSE_PARSER(zstr_len) EXPECTED(zstr_len <= SIMDJSON_CAPACITY_RECLAIM_THRESHOLD)
-#define SIMDJSON_PARAM_STREAM(stream) \
-    do { \
-    zval *res; \
-    Z_PARAM_RESOURCE(res); \
-    ZEND_ASSERT(Z_TYPE_P(res) == IS_RESOURCE); \
-    php_stream_from_res(stream, Z_RES_P(res)); \
-    } while (0);
 
 // Get parser that can be reused multiple times to avoid allocation and deallocation
 static simdjson_php_parser *simdjson_get_reused_parser() {
@@ -73,10 +62,6 @@ static simdjson_php_parser *simdjson_get_reused_parser() {
         ZEND_ASSERT(parser != NULL);
     }
     return parser;
-}
-
-PHP_SIMDJSON_API struct simdjson_php_parser *php_simdjson_get_default_singleton_parser(void) {
-    return simdjson_get_reused_parser();
 }
 
 // The simdjson parser accepts strings with at most 32-bit lengths, for now.
@@ -91,93 +76,6 @@ static zend_always_inline bool simdjson_validate_depth(zend_long depth, const in
         return false;
     }
     return true;
-}
-
-static const char* simdjson_stream_mmap(php_stream *stream, size_t size, size_t *mapped) {
-    // mmap has big overhead for small files, so use it just for files that are bigger than 1 MB
-    if (size < SIMDJSON_CAPACITY_RECLAIM_THRESHOLD) {
-        return NULL;
-    }
-    if (!php_stream_mmap_possible(stream)) {
-        return NULL;
-    }
-    const char* p = php_stream_mmap_range(stream, stream->position, PHP_STREAM_MMAP_ALL, PHP_STREAM_MAP_MODE_SHARED_READONLY, mapped);
-    if (p == NULL) {
-        return NULL;
-    }
-
-#if defined(HAVE_MMAP) && defined(MADV_SEQUENTIAL) && defined(MADV_WILLNEED)
-    // Give advise to OS how we will use mmapped file
-    madvise((void*)p, *mapped, MADV_SEQUENTIAL | MADV_WILLNEED);
-#endif
-
-    // Seek to end of mapped part of file
-    if (php_stream_seek(stream, *mapped, SEEK_CUR) != 0) {
-        php_stream_mmap_unmap(stream);
-        return NULL;
-    }
-    return p;
-}
-
-// Simplified version of _php_stream_copy_to_mem that allways allocated string with required padding and returns
-// char* instead of of zend_string* to avoid unnecessary overhead
-template <bool with_padding> static char *simdjson_stream_copy_to_mem(php_stream *src, size_t size, size_t *len) {
-    ssize_t ret = 0;
-    char *ptr;
-    size_t buflen;
-    int step = 8192;
-    int min_room = 8192 / 4;
-    char* result;
-
-    /* disabling the read buffer allows doing the whole transfer
-       in just one read() system call */
-    if (php_stream_is(src, PHP_STREAM_IS_STDIO)) {
-        php_stream_set_option(src, PHP_STREAM_OPTION_READ_BUFFER, PHP_STREAM_BUFFER_NONE, NULL);
-    }
-
-    /* avoid many reallocs by allocating a good-sized chunk to begin with, if
-     * we can.  Note that the stream may be filtered, in which case the stat
-     * result may be inaccurate, as the filter may inflate or deflate the
-     * number of bytes that we can read.  In order to avoid an upsize followed
-     * by a downsize of the buffer, overestimate by the step size (which is
-     * 8K).  */
-    if (size > 0) {
-        buflen = ZEND_MM_ALIGNED_SIZE(MAX(size - src->position, 0)) + step;
-    } else {
-        buflen = step;
-    }
-
-    result = (char*) emalloc(buflen);
-    ptr = result;
-
-    while ((ret = php_stream_read(src, ptr, buflen - *len)) > 0) {
-        *len += ret;
-        if (*len + min_room >= buflen) {
-            buflen += step;
-            result = (char*) erealloc(result, buflen);
-            ptr = result + *len;
-        } else {
-            ptr += ret;
-        }
-    }
-
-    if (*len == 0) {
-        efree(result);
-        return NULL;
-    }
-
-    if (with_padding) {
-        if (UNEXPECTED(*len + simdjson::SIMDJSON_PADDING > buflen)) {
-            result = (char*) erealloc(result, ZEND_MM_ALIGNED_SIZE(*len + simdjson::SIMDJSON_PADDING));
-        }
-
-#ifdef ZEND_DEBUG
-        // Set padding to zero to make valgrind happy
-        memset(result + *len, 0, simdjson::SIMDJSON_PADDING);
-#endif
-    }
-
-    return result;
 }
 
 PHP_FUNCTION(simdjson_validate) {
@@ -269,397 +167,6 @@ PHP_FUNCTION(simdjson_decode) {
     }
 }
 
-PHP_FUNCTION(simdjson_decode_from_stream) {
-    zend_bool associative = 0;
-    zend_long depth = SIMDJSON_PARSE_DEFAULT_DEPTH;
-    php_stream *stream;
-    char *json;
-    size_t len = 0;
-
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-        SIMDJSON_PARAM_STREAM(stream)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_BOOL(associative)
-        Z_PARAM_LONG(depth)
-    ZEND_PARSE_PARAMETERS_END();
-
-    if (!simdjson_validate_depth(depth, 3)) {
-        RETURN_THROWS();
-    }
-
-    simdjson_php_error_code error;
-
-    php_stream_statbuf ssbuf;
-    php_stream_stat(stream, &ssbuf);
-
-    const char* p = simdjson_stream_mmap(stream, ssbuf.sb.st_size, &len);
-    if (p != NULL) {
-        // No need to call simdjson_simple_decode as we mmap only files bigger that 1 MB
-        // Also we don't need to check if we should reuse parser
-        simdjson_php_parser *simdjson_php_parser = php_simdjson_create_parser();
-        error = php_simdjson_parse_buffer(simdjson_php_parser, p, len, return_value, associative, depth);
-        php_simdjson_free_parser(simdjson_php_parser);
-        php_stream_mmap_unmap_ex(stream, len);
-    } else {
-        if ((json = simdjson_stream_copy_to_mem<true>(stream, ssbuf.sb.st_size, &len)) == NULL) {
-            php_simdjson_throw_jsonexception(simdjson::EMPTY);
-            RETURN_THROWS();
-        }
-
-        if (simdjson_simple_decode(json, len, return_value, associative)) {
-            efree(json);
-            return;
-        }
-
-        if (SIMDJSON_SHOULD_REUSE_PARSER(len)) {
-            error = php_simdjson_parse_buffer(simdjson_get_reused_parser(), json, len, return_value, associative, depth);
-        } else {
-            simdjson_php_parser *simdjson_php_parser = php_simdjson_create_parser();
-            error = php_simdjson_parse_buffer(simdjson_php_parser, json, len, return_value, associative, depth);
-            php_simdjson_free_parser(simdjson_php_parser);
-        }
-
-        efree(json);
-    }
-
-    if (UNEXPECTED(error)) {
-        php_simdjson_throw_jsonexception(error);
-        RETURN_THROWS();
-    }
-}
-
-static bool simdjson_decode_from_input_check_max_size(size_t len) {
-    if (UNEXPECTED(SG(post_max_size) > 0 && len > SG(post_max_size))) {
-        zend_throw_exception_ex(simdjson_decoder_exception_ce, SIMDJSON_PHP_ERR_INPUT_SIZE_EXCEEDS,
-            "POST Content-Length of " ZEND_LONG_FMT " bytes exceeds the limit of " ZEND_LONG_FMT " bytes",
-            len, SG(post_max_size)
-        );
-        return true;
-    }
-    return false;
-}
-
-PHP_FUNCTION(simdjson_decode_from_input) {
-    zend_bool associative = 0;
-    zend_long depth = SIMDJSON_PARSE_DEFAULT_DEPTH;
-    char *json;
-    size_t len = 0;
-
-    ZEND_PARSE_PARAMETERS_START(0, 2)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_BOOL(associative)
-        Z_PARAM_LONG(depth)
-    ZEND_PARSE_PARAMETERS_END();
-
-    if (!simdjson_validate_depth(depth, 2)) {
-        RETURN_THROWS();
-    }
-
-    simdjson_php_error_code error;
-    php_stream *body;
-
-    if ((body = SG(request_info).request_body)) { // request body was already processed
-        if (SG(read_post_bytes) == 0) {
-            php_simdjson_throw_jsonexception(simdjson::EMPTY);
-            RETURN_THROWS();
-        }
-
-        if (simdjson_decode_from_input_check_max_size(SG(read_post_bytes))) {
-            RETURN_THROWS();
-        }
-
-#if PHP_VERSION_ID >= 80200
-        struct simdjson_php_stream_temp_data {
-        	php_stream *innerstream;
-        };
-
-        ZEND_ASSERT(php_stream_is(body, PHP_STREAM_IS_TEMP));
-        simdjson_php_stream_temp_data *ts = (simdjson_php_stream_temp_data*)body->abstract;
-        ZEND_ASSERT(ts != NULL);
-        ZEND_ASSERT(ts->innerstream != NULL);
-        if (php_stream_is(ts->innerstream, PHP_STREAM_IS_MEMORY)) {
-            // whole body is in memory, so we can just read stream buffer without allocating new buffer
-            zend_string *membuf = php_stream_memory_get_buffer(ts->innerstream);
-            if (simdjson_simple_decode(ZSTR_VAL(membuf), ZSTR_LEN(membuf), return_value, associative)) {
-                return;
-            }
-            // always use reused parser, as PHP stores max 64 kB (see SIMDJSON_SAPI_POST_BLOCK_SIZE) of body in memory
-            error = php_simdjson_parse(simdjson_get_reused_parser(), membuf, return_value, associative, depth);
-            if (UNEXPECTED(error)) {
-                php_simdjson_throw_jsonexception(error);
-                RETURN_THROWS();
-            }
-            return;
-        }
-#endif
-
-        // rewind to start of the request
-        php_stream_rewind(body);
-
-        // copy stream to memory
-        if ((json = simdjson_stream_copy_to_mem<true>(body, SG(read_post_bytes), &len)) == NULL) {
-            php_simdjson_throw_jsonexception(simdjson::EMPTY);
-            RETURN_THROWS();
-        }
-    } else {
-        if (SG(request_info).content_length == 0) {
-            php_simdjson_throw_jsonexception(simdjson::EMPTY);
-            RETURN_THROWS();
-        }
-        if (SG(request_info).content_length < 0) {
-            // I am not sure if content-length can be negative, so for now just throw exception
-            zend_throw_exception(simdjson_decoder_exception_ce, "POST Content-Length is required", SIMDJSON_PHP_ERR_INPUT_SIZE_EXCEEDS);
-            RETURN_THROWS();
-        }
-        if (SG(request_info).content_length > 0xFFFFFFFF) {
-            php_simdjson_throw_jsonexception(simdjson::CAPACITY);
-            RETURN_THROWS();
-        }
-        if (simdjson_decode_from_input_check_max_size(SG(request_info).content_length)) {
-            RETURN_THROWS();
-        }
-
-        body = php_stream_temp_create_ex(TEMP_STREAM_DEFAULT, SIMDJSON_SAPI_POST_BLOCK_SIZE, PG(upload_tmp_dir));
-        SG(request_info).request_body = body;
-
-        // allocate buffer for whole request with padding
-        json = (char*) emalloc(SG(request_info).content_length + simdjson::SIMDJSON_PADDING);
-
-        // read data from sapi, read one byte more so we can check if provided data exceeds content-length
-        len = sapi_read_post_block(json, SG(request_info).content_length + 1);
-
-        if (UNEXPECTED(len > SG(request_info).content_length)) {
-            efree(json);
-            zend_throw_exception_ex(simdjson_decoder_exception_ce, SIMDJSON_PHP_ERR_INPUT_SIZE_EXCEEDS,
-                "Actual POST length does not match Content-Length, and exceeds " ZEND_LONG_FMT " bytes",
-                SG(request_info).content_length
-            );
-            RETURN_THROWS();
-        }
-
-#ifdef ZEND_DEBUG
-        // Set padding to zero to make valgrind happy
-        memset(json + len, 0, simdjson::SIMDJSON_PADDING);
-#endif
-
-        // write whole input buffer also to request_body, so it can be read later
-        if (php_stream_write(body, json, len) != len) {
-            php_stream_truncate_set_size(body, 0);
-            php_error_docref(NULL, E_WARNING, "POST data can't be buffered; all data discarded");
-        }
-        php_stream_rewind(body);
-    }
-
-    if (simdjson_simple_decode(json, len, return_value, associative)) {
-        efree(json);
-        return;
-    }
-
-    if (SIMDJSON_SHOULD_REUSE_PARSER(len)) {
-        error = php_simdjson_parse_buffer(simdjson_get_reused_parser(), json, len, return_value, associative, depth);
-    } else {
-        simdjson_php_parser *simdjson_php_parser = php_simdjson_create_parser();
-        error = php_simdjson_parse_buffer(simdjson_php_parser, json, len, return_value, associative, depth);
-        php_simdjson_free_parser(simdjson_php_parser);
-    }
-
-    efree(json);
-
-    if (UNEXPECTED(error)) {
-        php_simdjson_throw_jsonexception(error);
-        RETURN_THROWS();
-    }
-}
-
-PHP_FUNCTION(simdjson_key_value) {
-    zend_string *json = NULL;
-    zend_string *key = NULL;
-    zend_bool associative = 0;
-    zend_long depth = SIMDJSON_PARSE_DEFAULT_DEPTH;
-
-    ZEND_PARSE_PARAMETERS_START(2, 4)
-        Z_PARAM_STR(json)
-        Z_PARAM_STR(key)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_BOOL(associative)
-        Z_PARAM_LONG(depth)
-    ZEND_PARSE_PARAMETERS_END();
-
-    if (!simdjson_validate_depth(depth, 4)) {
-        RETURN_THROWS();
-    }
-
-    simdjson_php_error_code error;
-    if (SIMDJSON_SHOULD_REUSE_PARSER(ZSTR_LEN(json))) {
-        error = php_simdjson_key_value(simdjson_get_reused_parser(), json, ZSTR_VAL(key), return_value, associative, depth);
-    } else {
-        simdjson_php_parser *simdjson_php_parser = php_simdjson_create_parser();
-        error = php_simdjson_key_value(simdjson_php_parser, json, ZSTR_VAL(key), return_value, associative, depth);
-        php_simdjson_free_parser(simdjson_php_parser);
-    }
-
-    if (UNEXPECTED(error)) {
-        php_simdjson_throw_jsonexception(error);
-        RETURN_THROWS();
-    }
-}
-
-PHP_FUNCTION(simdjson_key_count) {
-    zend_string *json = NULL;
-    zend_string *key = NULL;
-    zend_long depth = SIMDJSON_PARSE_DEFAULT_DEPTH;
-    bool throw_if_uncountable = false;
-
-    ZEND_PARSE_PARAMETERS_START(2, 4)
-        Z_PARAM_STR(json)
-        Z_PARAM_STR(key)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_LONG(depth)
-        Z_PARAM_BOOL(throw_if_uncountable)
-    ZEND_PARSE_PARAMETERS_END();
-
-    simdjson_php_error_code error;
-    if (SIMDJSON_SHOULD_REUSE_PARSER(ZSTR_LEN(json))) {
-        error = php_simdjson_key_count(simdjson_get_reused_parser(), json, ZSTR_VAL(key), return_value);
-    } else {
-        simdjson_php_parser *simdjson_php_parser = php_simdjson_create_parser();
-        error = php_simdjson_key_count(simdjson_php_parser, json, ZSTR_VAL(key), return_value);
-        php_simdjson_free_parser(simdjson_php_parser);
-    }
-
-    if (UNEXPECTED(error)) {
-        if (error == SIMDJSON_PHP_ERR_KEY_COUNT_NOT_COUNTABLE && !throw_if_uncountable) {
-            RETURN_LONG(0);
-        }
-        php_simdjson_throw_jsonexception(error);
-        RETURN_THROWS();
-    }
-}
-
-PHP_FUNCTION(simdjson_key_exists) {
-    zend_string *json = NULL;
-    zend_string *key = NULL;
-    zend_long depth = SIMDJSON_PARSE_DEFAULT_DEPTH;
-
-    ZEND_PARSE_PARAMETERS_START(2, 3)
-        Z_PARAM_STR(json)
-        Z_PARAM_STR(key)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_LONG(depth)
-    ZEND_PARSE_PARAMETERS_END();
-
-    simdjson_php_error_code error;
-    if (SIMDJSON_SHOULD_REUSE_PARSER(ZSTR_LEN(json))) {
-        error = php_simdjson_key_exists(simdjson_get_reused_parser(), json, ZSTR_VAL(key));
-    } else {
-        simdjson_php_parser *simdjson_php_parser = php_simdjson_create_parser();
-        error = php_simdjson_key_exists(simdjson_php_parser, json, ZSTR_VAL(key));
-        php_simdjson_free_parser(simdjson_php_parser);
-    }
-
-    switch (error) {
-        case simdjson::SUCCESS:
-            RETURN_TRUE;
-        case simdjson::NO_SUCH_FIELD:
-        case simdjson::INDEX_OUT_OF_BOUNDS:
-        case simdjson::INCORRECT_TYPE:
-            RETURN_FALSE;
-        default:
-            php_simdjson_throw_jsonexception(error);
-            RETURN_THROWS();
-    }
-}
-
-PHP_FUNCTION(simdjson_cleanup) {
-    if (zend_parse_parameters_none() == FAILURE) {
-        RETURN_THROWS();
-    }
-
-    simdjson_php_parser *parser = SIMDJSON_G(parser);
-    if (EXPECTED(parser != NULL)) {
-        php_simdjson_free_parser(parser);
-        SIMDJSON_G(parser) = NULL;
-    }
-    RETURN_TRUE;
-}
-
-static bool simdjson_is_valid_utf8(zend_string* string) {
-    // If string was already successfully validated, just return true
-    if (ZSTR_IS_VALID_UTF8(string)) {
-        return true;
-    }
-
-    bool is_valid = simdutf::validate_utf8(ZSTR_VAL(string), ZSTR_LEN(string));
-    if (EXPECTED(is_valid)) {
-        // String is UTF-8 valid, so we can also set proper flag
-        GC_ADD_FLAGS(string, IS_STR_VALID_UTF8);
-    }
-    return is_valid;
-}
-
-PHP_FUNCTION(simdjson_is_valid_utf8) {
-    zend_string *string;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_STR(string)
-    ZEND_PARSE_PARAMETERS_END();
-
-    RETURN_BOOL(simdjson_is_valid_utf8(string));
-}
-
-#ifdef ZEND_FRAMELESS_FUNCTION
-ZEND_FRAMELESS_FUNCTION(simdjson_is_valid_utf8, 1)
-{
-    zval str_tmp;
-    zend_string *string;
-
-    Z_FLF_PARAM_STR(1, string, str_tmp);
-
-    ZVAL_BOOL(return_value, simdjson_is_valid_utf8(string));
-
-flf_clean:
-    Z_FLF_PARAM_FREE_STR(1, str_tmp);
-}
-#endif
-
-static void simdjson_utf8_len(zend_string* string, zval* return_value) {
-    bool is_valid = ZSTR_IS_VALID_UTF8(string) || simdutf::validate_utf8(ZSTR_VAL(string), ZSTR_LEN(string));
-    if (EXPECTED(is_valid)) {
-        // String is UTF-8 valid, so we can also set proper flag
-        GC_ADD_FLAGS(string, IS_STR_VALID_UTF8);
-        // Compute number of chars
-        ZVAL_LONG(return_value, simdutf::count_utf8(ZSTR_VAL(string), ZSTR_LEN(string)));
-    } else {
-        // Return false in case string is not UTF-8 valid
-        ZVAL_BOOL(return_value, false);
-    }
-}
-
-PHP_FUNCTION(simdjson_utf8_len) {
-	zend_string *string;
-
-	ZEND_PARSE_PARAMETERS_START(1, 1)
-		Z_PARAM_STR(string)
-	ZEND_PARSE_PARAMETERS_END();
-
-    simdjson_utf8_len(string, return_value);
-}
-
-#ifdef ZEND_FRAMELESS_FUNCTION
-ZEND_FRAMELESS_FUNCTION(simdjson_utf8_len, 1)
-{
-    zval str_tmp;
-    zend_string *string;
-
-    Z_FLF_PARAM_STR(1, string, str_tmp);
-
-    simdjson_utf8_len(string, return_value);
-
-flf_clean:
-    Z_FLF_PARAM_FREE_STR(1, str_tmp);
-}
-#endif
-
 static const char *simdjson_get_error_msg(simdjson_encoder_error_code error_code) {
     switch(error_code) {
         case SIMDJSON_ERROR_NONE:
@@ -686,8 +193,6 @@ static const char *simdjson_get_error_msg(simdjson_encoder_error_code error_code
             return "Single unpaired UTF-16 surrogate in unicode escape";
         case SIMDJSON_ERROR_NON_BACKED_ENUM:
             return "Non-backed enums have no default serialization";
-        case SIMDJSON_ERROR_STREAM_WRITE:
-            return "Stream write error";
         default:
             return "Unknown error";
     }
@@ -794,253 +299,6 @@ PHP_FUNCTION(simdjson_encode) {
     RETURN_NEW_STR(simdjson_smart_str_extract(&buf));
 }
 
-PHP_FUNCTION(simdjson_encode_to_stream) {
-    zval *parameter;
-    simdjson_encoder encoder = {0};
-    smart_str buf = {0};
-    zend_long options = 0;
-    zend_long depth = 512;
-    php_stream *stream;
-
-    ZEND_PARSE_PARAMETERS_START(2, 4)
-        Z_PARAM_ZVAL(parameter)
-        SIMDJSON_PARAM_STREAM(stream)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_LONG(options)
-        Z_PARAM_LONG(depth)
-    ZEND_PARSE_PARAMETERS_END();
-
-    if (!simdjson_validate_encode_depth(depth, 4)) {
-        RETURN_THROWS();
-    }
-
-    encoder.max_depth = (int)depth;
-    encoder.options = (int)options;
-    encoder.stream = stream;
-
-    // Allocate output buffer to smallest size, so we remove checks if buffer was allocated in simdjson_encode_zval method
-    simdjson_smart_str_init(&buf);
-    if (simdjson_encode_zval(&buf, parameter, &encoder) == SUCCESS) {
-        if (options & SIMDJSON_APPEND_NEWLINE) {
-            simdjson_smart_str_appendc(&buf, '\n');
-        }
-
-        simdjson_encode_write_stream(&buf, &encoder); // write rest
-    }
-    efree(buf.s);
-
-    if (UNEXPECTED(encoder.error_code != SIMDJSON_ERROR_NONE)) {
-        zend_throw_exception(simdjson_encoder_exception_ce, simdjson_get_error_msg(encoder.error_code), encoder.error_code);
-        RETURN_THROWS();
-    }
-
-    RETURN_TRUE;
-}
-
-static zend_string* simdjson_base64_encode(const zend_string *binary_string, bool url) {
-    auto options = url ? simdutf::base64_url : simdutf::base64_default;
-    size_t encoded_length = simdutf::base64_length_from_binary(ZSTR_LEN(binary_string), options);
-    zend_string *result = zend_string_alloc(encoded_length, 0);
-    simdutf::binary_to_base64(ZSTR_VAL(binary_string), ZSTR_LEN(binary_string), ZSTR_VAL(result), options);
-    ZSTR_VAL(result)[encoded_length] = '\0';
-    GC_ADD_FLAGS(result, IS_STR_VALID_UTF8); // base64 encoded string must be always valid UTF-8 string
-    return result;
-}
-
-static zend_always_inline size_t simdjson_base64_decoded_length(size_t input_length) {
-    return (input_length * 3 + 3) / 4;
-}
-
-static zend_string* simdjson_base64_decode(const zend_string *string, bool strict, bool url) {
-    // Allocate maximum size that can be converted from base64 to binary string, we will set real length later
-    zend_string *output_string = zend_string_alloc(simdjson_base64_decoded_length(ZSTR_LEN(string)), 0);
-
-    auto last_chunk_handling = strict ? simdutf::last_chunk_handling_options::strict : simdutf::last_chunk_handling_options::loose;
-    auto options = url ? simdutf::base64_url : simdutf::base64_default;
-    simdutf::result result = simdutf::base64_to_binary(ZSTR_VAL(string), ZSTR_LEN(string), ZSTR_VAL(output_string), options, last_chunk_handling);
-
-    if (UNEXPECTED(result.error != simdutf::error_code::SUCCESS)) {
-        zend_string_efree(output_string);
-        return NULL;
-    }
-
-    ZSTR_LEN(output_string) = result.count;
-    ZSTR_VAL(output_string)[result.count] = '\0';
-    return output_string;
-}
-
-PHP_METHOD(SimdJsonBase64Encode, __construct) {
-    zend_string *binary_string = NULL;
-    bool base64_url = false;
-
-    ZEND_PARSE_PARAMETERS_START(1, 2)
-        Z_PARAM_STR(binary_string)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_BOOL(base64_url)
-    ZEND_PARSE_PARAMETERS_END();
-
-    return_value = ZEND_THIS;
-    ZVAL_STR_COPY(OBJ_PROP_NUM(Z_OBJ_P(ZEND_THIS), 0), binary_string);
-    ZVAL_BOOL(OBJ_PROP_NUM(Z_OBJ_P(ZEND_THIS), 1), base64_url);
-}
-
-PHP_METHOD(SimdJsonBase64Encode, jsonSerialize) {
-    ZEND_PARSE_PARAMETERS_NONE();
-
-    zend_string *binary_string = Z_STR_P(OBJ_PROP_NUM(Z_OBJ_P(ZEND_THIS), 0));
-    bool base64_url = Z_TYPE_INFO_P(OBJ_PROP_NUM(Z_OBJ_P(ZEND_THIS), 1)) == IS_TRUE;
-
-    zend_string *output_string = simdjson_base64_encode(binary_string, base64_url);
-    RETURN_NEW_STR(output_string);
-}
-
-PHP_FUNCTION(simdjson_base64_encode) {
-    zend_string *str;
-    bool url = false;
-    zend_long line_length = 0;
-    zend_string *output_string;
-
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-        Z_PARAM_STR(str)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_BOOL(url)
-        Z_PARAM_LONG(line_length)
-    ZEND_PARSE_PARAMETERS_END();
-
-    if (UNEXPECTED(line_length != 0)) {
-        if (line_length < 0) {
-            zend_argument_value_error(3, "must be greater than 0");
-            RETURN_THROWS();
-        }
-
-        auto options = url ? simdutf::base64_url : simdutf::base64_default;
-        size_t encoded_length = simdutf::base64_length_from_binary_with_lines(ZSTR_LEN(str), options, line_length);
-        output_string = zend_string_alloc(encoded_length, 0);
-        simdutf::binary_to_base64_with_lines(ZSTR_VAL(str), ZSTR_LEN(str), ZSTR_VAL(output_string), line_length, options);
-        ZSTR_VAL(output_string)[encoded_length] = '\0';
-        GC_ADD_FLAGS(output_string, IS_STR_VALID_UTF8); // base64 encoded string must be always valid UTF-8 string
-    } else {
-        output_string = simdjson_base64_encode(str, url);
-    }
-
-    RETURN_NEW_STR(output_string);
-}
-
-#ifdef ZEND_FRAMELESS_FUNCTION
-ZEND_FRAMELESS_FUNCTION(simdjson_base64_encode, 1)
-{
-    zval str_tmp;
-    zend_string *str;
-
-    Z_FLF_PARAM_STR(1, str, str_tmp);
-
-    ZVAL_NEW_STR(return_value, simdjson_base64_encode(str, false));
-
-flf_clean:
-    Z_FLF_PARAM_FREE_STR(1, str_tmp);
-}
-#endif
-
-PHP_FUNCTION(simdjson_base64_encode_from_stream) {
-    php_stream *stream;
-    bool url = false;
-    zend_long line_length = 0;
-    zend_string *output_string;
-    char *str;
-    size_t len = 0;
-    size_t encoded_length = 0;
-
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-        SIMDJSON_PARAM_STREAM(stream)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_BOOL(url)
-        Z_PARAM_LONG(line_length)
-    ZEND_PARSE_PARAMETERS_END();
-
-    if (UNEXPECTED(line_length < 0)) {
-        zend_argument_value_error(3, "must be greater than 0");
-        RETURN_THROWS();
-    }
-
-    auto options = url ? simdutf::base64_url : simdutf::base64_default;
-
-    php_stream_statbuf ssbuf;
-    php_stream_stat(stream, &ssbuf);
-
-    const char* p = simdjson_stream_mmap(stream, ssbuf.sb.st_size, &len);
-    if (p != NULL) {
-        if (line_length) {
-            encoded_length = simdutf::base64_length_from_binary_with_lines(len, options, line_length);
-            output_string = zend_string_alloc(encoded_length, 0);
-            simdutf::binary_to_base64_with_lines(p, len, ZSTR_VAL(output_string), line_length, options);
-        } else {
-            encoded_length = simdutf::base64_length_from_binary(len, options);
-            output_string = zend_string_alloc(encoded_length, 0);
-            simdutf::binary_to_base64(p, len, ZSTR_VAL(output_string), options);
-        }
-        php_stream_mmap_unmap_ex(stream, len);
-    } else {
-        if (UNEXPECTED((str = simdjson_stream_copy_to_mem<false>(stream, ssbuf.sb.st_size, &len)) == NULL)) {
-            RETURN_EMPTY_STRING(); // return false?
-        }
-
-        if (line_length) {
-            encoded_length = simdutf::base64_length_from_binary_with_lines(len, options, line_length);
-            output_string = zend_string_alloc(encoded_length, 0);
-            simdutf::binary_to_base64_with_lines(str, len, ZSTR_VAL(output_string), line_length, options);
-        } else {
-            encoded_length = simdutf::base64_length_from_binary(len, options);
-            output_string = zend_string_alloc(encoded_length, 0);
-            simdutf::binary_to_base64(str, len, ZSTR_VAL(output_string), options);
-        }
-        efree(str);
-    }
-
-    ZSTR_VAL(output_string)[encoded_length] = '\0';
-    GC_ADD_FLAGS(output_string, IS_STR_VALID_UTF8); // base64 encoded string must be always valid UTF-8 string
-    RETURN_NEW_STR(output_string);
-}
-
-PHP_FUNCTION(simdjson_base64_decode) {
-    zend_string *str;
-    bool strict = false;
-    bool url = false;
-
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-        Z_PARAM_STR(str)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_BOOL(strict)
-        Z_PARAM_BOOL(url)
-    ZEND_PARSE_PARAMETERS_END();
-
-    zend_string *output_string = simdjson_base64_decode(str, strict, url);
-    if (UNEXPECTED(output_string == NULL)) {
-        RETURN_FALSE;
-    }
-
-    RETURN_NEW_STR(output_string);
-}
-
-#ifdef ZEND_FRAMELESS_FUNCTION
-ZEND_FRAMELESS_FUNCTION(simdjson_base64_decode, 1)
-{
-    zval str_tmp;
-    zend_string *str, *output_string;
-
-    Z_FLF_PARAM_STR(1, str, str_tmp);
-
-    output_string = simdjson_base64_decode(str, false, false);
-    if (UNEXPECTED(output_string == NULL)) {
-        ZVAL_BOOL(return_value, false);
-    } else {
-        ZVAL_NEW_STR(return_value, output_string);
-    }
-
-flf_clean:
-    Z_FLF_PARAM_FREE_STR(1, str_tmp);
-}
-#endif
-
 /** {{{ PHP_GINIT_FUNCTION
 */
 PHP_GINIT_FUNCTION (simdjson) {
@@ -1055,31 +313,6 @@ PHP_GINIT_FUNCTION (simdjson) {
     GC_ADD_FLAGS(_dest, IS_STR_VALID_UTF8); \
 } while(0); \
 
-#if PHP_VERSION_ID >= 80400
-// For application/json content-type do not read request content to SG(request_info).request_body
-// simdjson_decode_from_input can handle reading from SAPI more efficiently
-// if simdjson_decode_from_input is not used, body will be read by in case it is really necessary
-static SAPI_POST_READER_FUNC(simdjson_post_reader) {
-    zend_long post_max_size = REQUEST_PARSE_BODY_OPTION_GET(post_max_size, SG(post_max_size));
-
-    if (post_max_size > 0 && SG(request_info).content_length > post_max_size) {
-        php_error_docref(NULL, E_WARNING, "POST Content-Length of " ZEND_LONG_FMT " bytes exceeds the limit of " ZEND_LONG_FMT " bytes",
-                    SG(request_info).content_length, post_max_size);
-    }
-}
-
-static SAPI_POST_HANDLER_FUNC(simdjson_post_handler) {
-    // intentionally empty
-}
-
-static sapi_post_entry simdjson_post_entry = {
-    "application/json",
-    sizeof("application/json") - 1,
-    simdjson_post_reader,
-    simdjson_post_handler
-};
-#endif
-
 /** {{{ PHP_MINIT_FUNCTION
 */
 PHP_MINIT_FUNCTION (simdjson) {
@@ -1088,19 +321,10 @@ PHP_MINIT_FUNCTION (simdjson) {
 #endif
     SIMDJSON_NEW_INTERNED_STRING(simdjson_json_serialize, "jsonserialize");
 
-    auto simdjson_exception_ce = register_class_SimdJsonException(spl_ce_RuntimeException);
-	simdjson_decoder_exception_ce = register_class_SimdJsonDecoderException(simdjson_exception_ce);
-	simdjson_encoder_exception_ce = register_class_SimdJsonEncoderException(simdjson_exception_ce);
-
-	simdjson_base64_encode_ce = register_class_SimdJsonBase64Encode(php_json_serializable_ce);
+	simdjson_decoder_exception_ce = spl_ce_RuntimeException;
+	simdjson_encoder_exception_ce = spl_ce_RuntimeException;
 
     register_simdjson_symbols(0);
-
-#if PHP_VERSION_ID >= 80400
-    if (sapi_register_post_entry(&simdjson_post_entry) == FAILURE) {
-        return FAILURE;
-    }
-#endif
 
     return SUCCESS;
 }
@@ -1109,9 +333,6 @@ PHP_MINIT_FUNCTION (simdjson) {
 /** {{{ PHP_MSHUTDOWN_FUNCTION
 */
 PHP_MSHUTDOWN_FUNCTION (simdjson) {
-#if PHP_VERSION_ID >= 80400
-    sapi_unregister_post_entry(&simdjson_post_entry);
-#endif
     return SUCCESS;
 }
 /* }}} */
@@ -1145,7 +366,6 @@ PHP_MINFO_FUNCTION (simdjson) {
     php_info_print_table_row(2, "Version", PHP_SIMDJSON_VERSION);
     php_info_print_table_row(2, "Support", SIMDJSON_SUPPORT_URL);
     php_info_print_table_row(2, "simdjson library version", SIMDJSON_VERSION);
-    php_info_print_table_row(2, "simdutf library version", SIMDUTF_VERSION);
     php_info_print_table_row(2, "Decoder implementation", simdjson::get_active_implementation()->description().c_str());
     php_info_print_table_row(2, "Encoder implementation", simdjson_encode_implementation());
 

@@ -26,14 +26,11 @@ extern "C" {
 
 #define SIMDJSON_PHP_TRY(EXPR) { auto _err = (EXPR); if (UNEXPECTED(_err)) { return _err; } }
 #define SIMDJSON_PHP_CHECK_ERROR(EXPR) { auto _err = (EXPR).error(); if (UNEXPECTED(_err)) { return _err; } }
-#define SIMDJSON_PHP_VALUE(EXPR) ({ auto _res = EXPR; auto _err = _res.error(); if (UNEXPECTED(_err)) { return _err; } _res.value_unsafe(); })
 
 #define SIMDJSON_DEPTH_CHECK_THRESHOLD 100000
 
 PHP_SIMDJSON_API const char* php_simdjson_error_msg(simdjson_php_error_code error) {
     switch (error) {
-        case SIMDJSON_PHP_ERR_KEY_COUNT_NOT_COUNTABLE:
-            return "JSON pointer refers to a value that cannot be counted";
         case SIMDJSON_PHP_ERR_INVALID_PHP_PROPERTY:
             return "Invalid property name";
         case simdjson::TAPE_ERROR:
@@ -53,22 +50,6 @@ PHP_SIMDJSON_API const char* php_simdjson_error_msg(simdjson_php_error_code erro
 
 PHP_SIMDJSON_API void php_simdjson_throw_jsonexception(simdjson_php_error_code error) {
     zend_throw_exception(simdjson_decoder_exception_ce, php_simdjson_error_msg(error), (zend_long) error);
-}
-
-static inline simdjson::simdjson_result<simdjson::dom::element>
-get_key_with_optional_prefix(simdjson::dom::element &doc, std::string_view json_pointer) {
-    /* https://www.rfc-editor.org/rfc/rfc6901.html */
-    /* TODO: Deprecate in a subsequent minor release and remove in a major release to comply with the standard. */
-    auto std_pointer = ((!json_pointer.empty() && json_pointer[0] != '/') ? "/" : "") + std::string(json_pointer.begin(), json_pointer.end());
-    return doc.at_pointer(std_pointer);
-}
-
-static inline simdjson::simdjson_result<simdjson::ondemand::value>
-get_key_with_optional_prefix_ondemand(simdjson::ondemand::document &doc, std::string_view json_pointer) {
-    /* https://www.rfc-editor.org/rfc/rfc6901.html */
-    /* TODO: Deprecate in a subsequent minor release and remove in a major release to comply with the standard. */
-    auto std_pointer = ((!json_pointer.empty() && json_pointer[0] != '/') ? "/" : "") + std::string(json_pointer.begin(), json_pointer.end());
-    return doc.at_pointer(std_pointer);
 }
 
 // Initialize stdClass object and return pointer to propertires HashTable
@@ -631,15 +612,22 @@ static simdjson_php_error_code simdjson_ondemand_validate(simdjson::ondemand::va
         return simdjson::DEPTH_ERROR;
     }
 
-    switch (SIMDJSON_PHP_VALUE(element.type())) {
+    simdjson::ondemand::json_type type;
+    SIMDJSON_PHP_TRY(element.type().get(type));
+
+    switch (type) {
         case simdjson::ondemand::json_type::array:
             for (auto child : element.get_array()) {
-                SIMDJSON_PHP_TRY(simdjson_ondemand_validate(SIMDJSON_PHP_VALUE(child), max_depth));
+                simdjson::ondemand::value child_value;
+                SIMDJSON_PHP_TRY(child.get(child_value));
+                SIMDJSON_PHP_TRY(simdjson_ondemand_validate(child_value, max_depth));
             }
             break;
         case simdjson::ondemand::json_type::object:
             for (auto field : element.get_object()) {
-                SIMDJSON_PHP_TRY(simdjson_ondemand_validate(SIMDJSON_PHP_VALUE(field).value(), max_depth));
+                simdjson::ondemand::field object_field;
+                SIMDJSON_PHP_TRY(std::move(field).get(object_field));
+                SIMDJSON_PHP_TRY(simdjson_ondemand_validate(object_field.value(), max_depth));
             }
             break;
         case simdjson::ondemand::json_type::number:
@@ -664,7 +652,10 @@ PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_validate(simdjson_php_pars
     SIMDJSON_PHP_TRY(parser->ondemand_parser.iterate(simdjson_padded_string_view(json, jsonbuffer)).get(doc));
 
     // In case document is just scalar type, directly return error code
-    switch (SIMDJSON_PHP_VALUE(doc.type())) {
+    simdjson::ondemand::json_type type;
+    SIMDJSON_PHP_TRY(doc.type().get(type));
+
+    switch (type) {
         case simdjson::ondemand::json_type::number:
             return doc.get_number().error();
         case simdjson::ondemand::json_type::string:
@@ -692,57 +683,3 @@ PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_parse(simdjson_php_parser*
     return simdjson_convert_element(doc, return_value, associative, parser);
 }
 
-PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_parse_buffer(simdjson_php_parser* parser, const char *json, size_t len, zval *return_value, bool associative, size_t depth) /* {{{ */ {
-    simdjson::dom::element doc;
-
-    SIMDJSON_PHP_TRY(build_parsed_json_cust(parser, doc, json, len, false, depth));
-    return simdjson_convert_element(doc, return_value, associative, parser);
-}
-
-/* }}} */
-PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_key_value(simdjson_php_parser* parser, const zend_string *json, const char *key, zval *return_value, bool associative,
-                              size_t depth) /* {{{ */ {
-    simdjson::dom::element doc;
-    simdjson::dom::element element;
-    SIMDJSON_PHP_TRY(build_parsed_json_cust(parser, doc, ZSTR_VAL(json), ZSTR_LEN(json), simdjson_realloc_needed(json), depth));
-    SIMDJSON_PHP_TRY(get_key_with_optional_prefix(doc, key).get(element));
-    return simdjson_convert_element(element, return_value, associative, parser);
-}
-
-/* }}} */
-
-PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_key_exists(simdjson_php_parser* parser, const zend_string *json, const char *key) {
-    simdjson::padded_string jsonbuffer;
-    simdjson::ondemand::document doc;
-
-    SIMDJSON_PHP_TRY(parser->ondemand_parser.iterate(simdjson_padded_string_view(json, jsonbuffer)).get(doc));
-    return get_key_with_optional_prefix_ondemand(doc, key).error();
-}
-
-PHP_SIMDJSON_API simdjson_php_error_code php_simdjson_key_count(simdjson_php_parser* parser, const zend_string *json, const char *key, zval *return_value) {
-    simdjson::padded_string jsonbuffer;
-    simdjson::ondemand::document doc;
-    simdjson::ondemand::value value;
-    simdjson::ondemand::json_type type;
-
-    SIMDJSON_PHP_TRY(parser->ondemand_parser.iterate(simdjson_padded_string_view(json, jsonbuffer)).get(doc));
-    SIMDJSON_PHP_TRY(get_key_with_optional_prefix_ondemand(doc, key).get(value));
-    SIMDJSON_PHP_TRY(value.type().get(type));
-
-    size_t key_count;
-    switch (type) {
-        case simdjson::ondemand::json_type::array:
-            SIMDJSON_PHP_TRY(value.count_elements().get(key_count));
-            break;
-
-        case simdjson::ondemand::json_type::object:
-            SIMDJSON_PHP_TRY(value.count_fields().get(key_count));
-            break;
-
-        default:
-            return SIMDJSON_PHP_ERR_KEY_COUNT_NOT_COUNTABLE;
-    }
-
-    ZVAL_LONG(return_value, key_count);
-    return simdjson::SUCCESS;
-}

@@ -34,10 +34,12 @@ extern "C" {
 #include "php_simdjson.h"
 #include "simdjson_encoder.h"
 #include "simdjson_integer_writer.h"
-#if defined(__SSE2__) || defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__SSE2__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)
+#define SIMDJSON_PHP_USE_VECTOR8 1
 #include "simdjson_vector8.h"
 #endif
-#if defined(__SSE2__)
+#if defined(__SSE2__) && !defined(_MSC_VER)
+#define SIMDJSON_PHP_USE_AVX2 1
 #include "simdjson_avx2.h"
 #endif
 #include "simdjson.h"
@@ -124,7 +126,7 @@ static zend_always_inline size_t simdjson_append_escape(char *buf, char c) {
         } \
     } while (0); \
 
-#if defined(__SSE2__) || defined(__aarch64__) || defined(_M_ARM64)
+#ifdef SIMDJSON_PHP_USE_VECTOR8
 template<typename T>
 static zend_always_inline void simdjson_escape_long_string(smart_str *buf, const char *s, size_t len) {
     T chunk;
@@ -186,7 +188,7 @@ static zend_always_inline void simdjson_escape_long_string(smart_str *buf, const
 }
 #endif
 
-#ifdef __SSE2__
+#ifdef SIMDJSON_PHP_USE_AVX2
 static zend_always_inline bool simdjson_avx2_supported() {
 #ifdef __AVX2__
     return true;
@@ -354,14 +356,14 @@ static zend_result simdjson_escape_string(smart_str *buf, zend_string *str, simd
 		}
     }
 
-#ifdef __SSE2__
+#ifdef SIMDJSON_PHP_USE_AVX2
    if (len >= sizeof(simdjson_avx2) && simdjson_avx2_supported()) {
      	simdjson_escape_long_string_avx2(buf, s, len);
         return SUCCESS;
    }
 #endif
 
-#if defined(__SSE2__) || defined(__aarch64__) || defined(_M_ARM64)
+#ifdef SIMDJSON_PHP_USE_VECTOR8
     if (len >= sizeof(simdjson_vector8)) {
     	simdjson_escape_long_string<simdjson_vector8>(buf, s, len);
         return SUCCESS;
@@ -772,21 +774,6 @@ static zend_result simdjson_encode_array_or_object(smart_str *buf, zval *val, si
 	return simdjson_encode_object(buf, val, encoder);
 }
 
-static void simdjson_encode_base64_object(smart_str *buf, const zval *val) {
-    const zend_string *binary_string = Z_STR_P(OBJ_PROP_NUM(Z_OBJ_P(val), 0));
-    bool base64_url = Z_TYPE_INFO_P(OBJ_PROP_NUM(Z_OBJ_P(val), 1)) == IS_TRUE;
-    auto options = base64_url ? simdutf::base64_url : simdutf::base64_default;
-
-    // As we are sure that base64 encoded string is always valid UTF-8 and do not contain any char that need to be
-    // escaped, so we can skip all checks and just directly copy encoded string to output buffer
-    size_t encoded_length = simdutf::base64_length_from_binary(ZSTR_LEN(binary_string), options);
-    char* output = simdjson_smart_str_extend(buf, encoded_length + 2);
-    *output++ = '"';
-    simdutf::binary_to_base64(ZSTR_VAL(binary_string), ZSTR_LEN(binary_string), output, options);
-    output += encoded_length;
-    *output = '"';
-}
-
 static zend_result simdjson_encode_serializable_object(smart_str *buf, zval *val, simdjson_encoder *encoder) {
 	zend_class_entry *ce = Z_OBJCE_P(val);
 	zend_object *obj = Z_OBJ_P(val);
@@ -871,13 +858,6 @@ static zend_result simdjson_encode_serializable_enum(smart_str *buf, zval *val, 
 #endif
 
 zend_result simdjson_encode_zval(smart_str *buf, zval *val, simdjson_encoder *encoder) {
-    // For simdjson_encode_to_stream method, write data to stream if buffer is larger than 64 kilobytes
-    if (UNEXPECTED(encoder->stream != NULL && ZSTR_LEN(buf->s) >= 64 * 1024)) {
-    	if (simdjson_encode_write_stream(buf, encoder) == FAILURE) {
-          	return FAILURE;
-    	}
-    }
-
 again:
 	switch (Z_TYPE_P(val))
 	{
@@ -909,10 +889,6 @@ again:
 			return simdjson_escape_string(buf, Z_STR_P(val), encoder);
 
 		case IS_OBJECT:
-			if (Z_OBJCE_P(val) == simdjson_base64_encode_ce) {
-                simdjson_encode_base64_object(buf, val);
-                return SUCCESS;
-            }
 			if (instanceof_function_slow(Z_OBJCE_P(val), php_json_serializable_ce)) {
 				return simdjson_encode_serializable_object(buf, val, encoder);
 			}
@@ -946,28 +922,15 @@ again:
 	return SUCCESS;
 }
 
-zend_result simdjson_encode_write_stream(smart_str *buf, simdjson_encoder* encoder) {
-	ssize_t numbytes = php_stream_write(encoder->stream, ZSTR_VAL(buf->s), ZSTR_LEN(buf->s));
-	if (UNEXPECTED(numbytes < 0)) {
-		encoder->error_code = SIMDJSON_ERROR_STREAM_WRITE;
-		return FAILURE;
-	}
-	if (UNEXPECTED(numbytes != ZSTR_LEN(buf->s))) {
-		php_error_docref(NULL, E_WARNING, "Only %zd of %zd bytes written, possibly out of free disk space", numbytes, ZSTR_LEN(buf->s));
-		encoder->error_code = SIMDJSON_ERROR_STREAM_WRITE;
-		return FAILURE;
-    }
-	ZSTR_LEN(buf->s) = 0; // cleanup buffer
-    return SUCCESS;
-}
-
 const char* simdjson_encode_implementation() {
-#ifdef __SSE2__
+#ifdef SIMDJSON_PHP_USE_AVX2
       if (simdjson_avx2_supported()) {
           return "AVX2";
       } else {
           return "SSE2";
       }
+#elif defined(__SSE2__) || defined(_M_X64)
+      return "SSE2";
 #elif defined(__aarch64__) || defined(_M_ARM64)
       return "ARM64 NEON";
 #else

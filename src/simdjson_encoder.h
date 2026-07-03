@@ -18,7 +18,6 @@ typedef enum {
     SIMDJSON_ERROR_INVALID_PROPERTY_NAME,
     SIMDJSON_ERROR_UTF16,
     SIMDJSON_ERROR_NON_BACKED_ENUM,
-    SIMDJSON_ERROR_STREAM_WRITE,
 } simdjson_encoder_error_code;
 
 /* simdjson_encode() options */
@@ -35,7 +34,6 @@ struct _simdjson_encoder {
     int max_depth;
     int options;
     simdjson_encoder_error_code error_code;
-    php_stream *stream;
 };
 
 // max length of escaped string is 6 chars, but we coping 8 bytes is faster on 64 platforms
@@ -155,8 +153,6 @@ static const char simdjson_need_escaping[] = {
 };
 
 zend_result simdjson_encode_zval(smart_str *buf, zval *val, simdjson_encoder *encoder);
-
-zend_result simdjson_encode_write_stream(smart_str *buf, simdjson_encoder* encoder);
 
 const char* simdjson_encode_implementation();
 

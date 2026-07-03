@@ -2,8 +2,11 @@
 #define SIMDJSON_VECTOR8_H
 
 // SSE2
-#ifdef __SSE2__
+#if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #define simdjson_vector8_broadcast _mm_set1_epi8
 #define simdjson_vector8_eq _mm_cmpeq_epi8
@@ -25,14 +28,14 @@
 
 
 struct simdjson_vector8 {
-#ifdef __SSE2__
+#if defined(__SSE2__) || defined(_M_X64)
     __m128i chunk;
 #elif defined(__aarch64__) || defined(_M_ARM64)
     uint8x16_t chunk;
 #endif
 
     inline void load(const uint8_t *s) {
-#ifdef __SSE2__
+#if defined(__SSE2__) || defined(_M_X64)
         chunk = _mm_loadu_si128((const __m128i *) s);
 #elif defined(__aarch64__) || defined(_M_ARM64)
         chunk = vld1q_u8(s);
@@ -40,7 +43,7 @@ struct simdjson_vector8 {
     }
 
     inline void store(uint8_t *s) {
-#ifdef __SSE2__
+#if defined(__SSE2__) || defined(_M_X64)
         _mm_storeu_si128((__m128i*)s, chunk);
 #elif defined(__aarch64__) || defined(_M_ARM64)
         vst1q_u8(s, chunk);
@@ -58,7 +61,15 @@ struct simdjson_vector8 {
     }
 
     inline uint64_t escape_index(uint64_t mask) {
-#ifdef __SSE2__
+#ifdef _MSC_VER
+        unsigned long index;
+        _BitScanForward64(&index, mask);
+#if defined(_M_ARM64) && !defined(__SSE2__) && !defined(_M_X64)
+        return index / 4;
+#else
+        return index;
+#endif
+#elif defined(__SSE2__)
         return __builtin_ctzll(mask);
 #elif defined(__aarch64__) || defined(_M_ARM64)
         return __builtin_ctzll(mask) / 4;

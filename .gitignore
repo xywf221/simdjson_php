@@ -41,3 +41,6 @@ configure.ac
 benchmark/vendor
 composer.lock
 .idea
+*.dll
+*.exp
+*.lib
